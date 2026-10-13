@@ -112,6 +112,7 @@ impl App {
         let mut want_run_tab = false;
         let mut want_save = false;
         let mut want_retry_tiles = false;
+        let mut want_import = false;
 
         // 工具栏（普通布局，画布上方）
         ui.horizontal_wrapped(|ui| {
@@ -133,6 +134,9 @@ impl App {
             if ui.small_button("清空").clicked() {
                 self.draw_page.points.clear();
                 self.draw_page.status = String::new();
+            }
+            if ui.small_button("导入").clicked() {
+                want_import = true;
             }
             ui.checkbox(&mut self.draw_page.auto_close, "闭合");
             if ui.small_button("保存路线").clicked() {
@@ -359,6 +363,9 @@ impl App {
         if want_save {
             self.save_drawn_route();
         }
+        if want_import {
+            self.import_route_csv();
+        }
         if want_run_tab {
             // 去跑步：自动切换到手绘路线模式
             self.run_page.route_mode = crate::track::generate_road::RouteMode::Drawn;
@@ -531,6 +538,27 @@ impl App {
             egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
             egui::Color32::WHITE,
         );
+    }
+
+    /// 从外部目录导入轨迹 CSV（`time, X, Y, Z` = ECEF 米），转换为 GCJ-02 途经点。
+    fn import_route_csv(&mut self) {
+        let path = "/sdcard/Android/data/org.nekosportsworld.tool/files/import_route.csv";
+        match std::fs::read_to_string(path) {
+            Ok(text) => match crate::track::custom::parse_ecef_csv(&text, 600) {
+                Ok(pts) => {
+                    let n = pts.len();
+                    self.draw_page.points = pts;
+                    self.draw_page.auto_close = true; // 轨迹默认绕圈
+                    self.draw_page.fitted = false; // 重新适配视野
+                    self.draw_page.status =
+                        format!("√ 已导入 {n} 个轨迹点，点「保存路线」生效");
+                }
+                Err(e) => self.draw_page.status = format!("导入失败：{e}"),
+            },
+            Err(e) => {
+                self.draw_page.status = format!("未找到导入文件（import_route.csv）：{e}");
+            }
+        }
     }
 
     fn save_drawn_route(&mut self) {

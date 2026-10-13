@@ -215,6 +215,21 @@ fn transform_lng(x: f64, y: f64) -> f64 {
     ret
 }
 
+/// ECEF（地心地固直角坐标，WGS84，米）→ 大地坐标 (lat, lon)，迭代法。
+pub fn ecef_to_wgs84(x: f64, y: f64, z: f64) -> (f64, f64) {
+    let a = 6378137.0; // WGS84 长半轴
+    let e2 = 6.69437999014e-3; // 第一偏心率平方
+    let lon = y.atan2(x);
+    let p = (x * x + y * y).sqrt();
+    let mut lat = z.atan2(p * (1.0 - e2));
+    for _ in 0..8 {
+        let n = a / (1.0 - e2 * lat.sin().powi(2)).sqrt();
+        let h = p / lat.cos() - n;
+        lat = z.atan2(p * (1.0 - e2 * n / (n + h)));
+    }
+    (lat.to_degrees(), lon.to_degrees())
+}
+
 /// WGS84 → GCJ-02（火星坐标，境内偏移）。
 pub fn wgs84_to_gcj02(lat: f64, lng: f64) -> (f64, f64) {
     if out_of_china(lat, lng) {

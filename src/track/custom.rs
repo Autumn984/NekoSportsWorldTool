@@ -92,6 +92,69 @@ pub fn load_drawn_route() -> Option<DrawnRouteFile> {
     Some(doc)
 }
 
+/// 解析导入的轨迹 CSV：`时间, X, Y, Z`（X/Y/Z 为 ECEF 地心地固坐标，米）。
+/// 转换为 GCJ-02（与高德瓦片同基准），并降采样到 max_pts 个点。
+pub fn parse_ecef_csv(text: &str, max_pts: usize) -> Result<Vec<(f64, f64)>, String> {
+    let mut pts: Vec<(f64, f64)> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+        // 支持 3 列（x,y,z）或 4 列（time,x,y,z）
+        let (x, y, z) = if parts.len() >= 4 {
+            (
+                parts[1].parse::<f64>().map_err(|e| format!("X 解析失败: {e}"))?,
+                parts[2].parse::<f64>().map_err(|e| format!("Y 解析失败: {e}"))?,
+                parts[3].parse::<f64>().map_err(|e| format!("Z 解析失败: {e}"))?,
+            )
+        } else if parts.len() == 3 {
+            (
+                parts[0].parse::<f64>().map_err(|e| format!("X 解析失败: {e}"))?,
+                parts[1].parse::<f64>().map_err(|e| format!("Y 解析失败: {e}"))?,
+                parts[2].parse::<f64>().map_err(|e| format!("Z 解析失败: {e}"))?,
+            )
+        } else {
+            continue;
+        };
+        if x.abs() > 1.0e7 || y.abs() > 1.0e7 || z.abs() > 1.0e7 {
+            continue; // 明显越界行
+        }
+        let (lat, lon) = crate::track::geom::ecef_to_wgs84(x, y, z);
+        let (glat, glon) = crate::track::geom::wgs84_to_gcj02(lat, lon);
+        // 与上一点距离过近（<0.5 米）则跳过，避免重复点
+        if let Some(&(pla, plo)) = pts.last() {
+            let dlat = (glat - pla) * crate::track::geom::MET_PER_DEG_LAT;
+            let dlng = (glon - plo) * crate::track::geom::MET_PER_DEG_LNG;
+            if (dlat * dlat + dlng * dlng).sqrt() < 0.5 {
+                continue;
+            }
+        }
+        pts.push((glat, glon));
+    }
+    if pts.len() < 2 {
+        return Err("有效轨迹点不足 2 个".into());
+    }
+    // 降采样
+    if pts.len() > max_pts {
+        let step = pts.len() as f64 / max_pts as f64;
+        let mut out: Vec<(f64, f64)> = Vec::with_capacity(max_pts);
+        let mut i = 0.0f64;
+        while (i as usize) < pts.len() && out.len() < max_pts {
+            out.push(pts[i as usize]);
+            i += step;
+        }
+        if let Some(last) = pts.last() {
+            if out.last() != Some(last) {
+                out.push(*last);
+            }
+        }
+        pts = out;
+    }
+    Ok(pts)
+}
+
 /// 由 GCJ-02 标定点构建平滑闭环（BD-09）：标定点经 Catmull-Rom 拟合成自然曲线；
 /// auto_close 时首尾相接成环，开链按单程处理。
 pub fn ring_from_gcj_polyline(
@@ -512,6 +575,39 @@ pub fn build_custom(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ECEF 反解应落在海口区域（CSV 首行真实值）。
+    #[test]
+    fn ecef_csv_first_point_is_haikou() {
+        let (lat, lon) = crate::track::geom::ecef_to_wgs84(
+            -2081798.439,
+            5620358.051,
+            2174073.353,
+        );
+        // 海口/海南大学一带：约 20.0°N, 110.3°E
+        assert!((lat - 20.0).abs() < 1.0, "lat={lat}");
+        assert!((lon - 110.3).abs() < 1.0, "lon={lon}");
+    }
+
+    /// 解析 ECEF CSV 并转 GCJ-02：点数合理、坐标连续无跳变。
+    #[test]
+    fn parse_ecef_csv_works() {
+        let text = "\
+0.0,-2081798.439, 5620358.051, 2174073.353
+0.1,-2081798.222, 5620358.131, 2174073.354
+0.2,-2081798.004, 5620358.211, 2174073.356
+0.3,-2081797.787, 5620358.291, 2174073.357
+";
+        let pts = parse_ecef_csv(text, 600).unwrap();
+        assert!(pts.len() >= 2);
+        // 相邻点距离应远小于 1km（平滑轨迹）
+        for w in pts.windows(2) {
+            let dlat = (w[1].0 - w[0].0) * crate::track::geom::MET_PER_DEG_LAT;
+            let dlng = (w[1].1 - w[0].1) * crate::track::geom::MET_PER_DEG_LNG;
+            let d = (dlat * dlat + dlng * dlng).sqrt();
+            assert!(d < 1000.0, "相邻点距离 {d}m 过大");
+        }
+    }
 
     fn sample_ring() -> CustomRing {
         // 校园内一个 1km 左右的闭环（BD-09，与打卡点同系）
