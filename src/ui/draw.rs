@@ -346,15 +346,41 @@ impl App {
             return;
         }
         self.draw_page.overlay_fp = fp;
-        if n == 0 {
-            self.draw_page.overlay_tex = None;
-            return;
-        }
         // 2× 逻辑分辨率光栅化
         let scale = 2.0f32;
         let w = (canvas.width() * scale).round() as usize;
         let h = (canvas.height() * scale).round() as usize;
         if w < 4 || h < 4 {
+            return;
+        }
+        let mut buf = vec![0u8; w * h * 4];
+        // 地图边框（框住画布：即使没有路线也绘制，形成「框框」）
+        let border = [110u8, 122, 118];
+        let bw = (2.0 * scale).max(2.0) as usize;
+        for x in 0..w {
+            for t in 0..bw {
+                blend_px(&mut buf, w, x, t, border, 255);
+                blend_px(&mut buf, w, x, h - 1 - t, border, 255);
+            }
+        }
+        for y in 0..h {
+            for t in 0..bw {
+                blend_px(&mut buf, w, t, y, border, 255);
+                blend_px(&mut buf, w, w - 1 - t, y, border, 255);
+            }
+        }
+        if n == 0 {
+            let img = egui::ColorImage::from_rgba_unmultiplied([w, h], &buf);
+            let tex = ui
+                .ctx()
+                .load_texture("draw_route_overlay", img, egui::TextureOptions::LINEAR);
+            self.draw_page.overlay_tex = Some(tex.clone());
+            painter.image(
+                tex.id(),
+                canvas,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
             return;
         }
         let to_px = |la: f64, lo: f64| -> (f32, f32) {
@@ -373,7 +399,6 @@ impl App {
             segs.push((to_px(a.0, a.1), to_px(b.0, b.1), [120u8, 140, 134], 1.5));
         }
 
-        let mut buf = vec![0u8; w * h * 4];
         for (a, b, col, width) in &segs {
             let half = (*width as f32 * scale * 0.5).max(1.0);
             let minx = ((a.0.min(b.0) - half - 2.0).floor().max(0.0)) as usize;

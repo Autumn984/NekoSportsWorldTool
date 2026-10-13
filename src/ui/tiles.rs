@@ -174,9 +174,9 @@ impl TileState {
         let zt = zoom.round().clamp(ZOOM_MIN, ZOOM_MAX) as u32;
         let (wx, wy) = lonlat_to_world(center.1, center.0, zt as f64);
         let c = rect.center();
-        // 屏幕左上角对应的世界像素
-        let left = wx - (c.x - rect.left()) as f64 + offset.x as f64;
-        let top = wy - (c.y - rect.top()) as f64 + offset.y as f64;
+        // 屏幕左上角对应的世界像素（偏移符号与 draw/map.to_screen 一致）
+        let left = wx - (c.x - rect.left()) as f64 - offset.x as f64;
+        let top = wy - (c.y - rect.top()) as f64 - offset.y as f64;
         let x0 = (left / TILE_PX).floor() as i64;
         let y0 = (top / TILE_PX).floor() as i64;
         let n = (rect.width() as f64 / TILE_PX).ceil() as i64 + 2;
@@ -216,6 +216,9 @@ impl TileState {
     }
 
     /// 绘制可见瓦片（世界像素 → 屏幕矩形）。
+    /// - 偏移符号与 map.rs to_screen 一致：offset 增大 → 内容向右（跟随手指）。
+    /// - 当前层级瓦片缺失时，用相邻层级（±2）瓦片缩放兜底，避免缩放瞬间空白。
+    /// - 所有瓦片裁剪到 rect 内，不越出地图框。
     pub fn draw(
         &self,
         painter: &egui::Painter,
@@ -228,41 +231,64 @@ impl TileState {
         let scale = 2f64.powf((zoom - zt as f32) as f64);
         let (wx, wy) = lonlat_to_world(center.1, center.0, zt as f64);
         let c = rect.center();
-        let left = wx - (c.x - rect.left()) as f64 + offset.x as f64;
-        let top = wy - (c.y - rect.top()) as f64 + offset.y as f64;
-        let x0 = (left / TILE_PX).floor() as i64;
-        let y0 = (top / TILE_PX).floor() as i64;
-        let n = (rect.width() as f64 / TILE_PX).ceil() as i64 + 2;
-        let m = (rect.height() as f64 / TILE_PX).ceil() as i64 + 2;
-        let max_tile = (1i64 << zt) - 1;
-        for dy in 0..m {
-            for dx in 0..n {
-                let x = x0 + dx;
-                let y = y0 + dy;
-                if x < 0 || y < 0 || x > max_tile || y > max_tile {
+        let left = wx - (c.x - rect.left()) as f64 - offset.x as f64;
+        let top = wy - (c.y - rect.top()) as f64 - offset.y as f64;
+
+        // 从远层级到近层级绘制（当前层级最后画，盖在兜底瓦片上方）
+        let mut levels: Vec<u32> = self
+            .textures
+            .keys()
+            .map(|k| k.z)
+            .filter(|z| (*z as i64 - zt as i64).abs() <= 2)
+            .collect();
+        levels.sort_by_key(|z| (z.abs_diff(zt), *z));
+        levels.dedup();
+        for lv in levels.iter().rev() {
+            let lv_scale = 2f64.powi(*lv as i32 - zt as i32); // zt 世界像素下该层级瓦片边长倍率
+            for (key, tex) in &self.textures {
+                if key.z != *lv {
                     continue;
                 }
-                let key = TileKey { z: zt, x: x as u32, y: y as u32 };
-                if let Some(tex) = self.textures.get(&key) {
-                    let sx = (x as f64 * TILE_PX - left) * scale + rect.left() as f64;
-                    let sy = (y as f64 * TILE_PX - top) * scale + rect.top() as f64;
-                    let size = (TILE_PX * scale) as f32;
-                    painter.image(
-                        tex.id(),
-                        egui::Rect::from_min_size(
-                            egui::Pos2::new(sx as f32, sy as f32),
-                            egui::Vec2::splat(size),
-                        ),
-                        egui::Rect::from_min_max(
-                            egui::Pos2::ZERO,
-                            egui::Pos2::new(1.0, 1.0),
-                        ),
-                        egui::Color32::WHITE,
-                    );
-                }
+                let xw = key.x as f64 * TILE_PX * lv_scale;
+                let yw = key.y as f64 * TILE_PX * lv_scale;
+                let sx = (xw - left) * scale + rect.left() as f64;
+                let sy = (yw - top) * scale + rect.top() as f64;
+                let size = (TILE_PX * lv_scale * scale) as f32;
+                let full = egui::Rect::from_min_size(
+                    egui::Pos2::new(sx as f32, sy as f32),
+                    egui::Vec2::splat(size),
+                );
+                draw_image_clipped(painter, tex.id(), full, rect);
             }
         }
     }
+}
+
+/// 绘制图片并裁剪到 clip 内（手动求交并换算 UV，避免本设备上 clip 区域异常）。
+fn draw_image_clipped(
+    painter: &egui::Painter,
+    tex: egui::TextureId,
+    full: egui::Rect,
+    clip: egui::Rect,
+) {
+    let inter = full.intersect(clip);
+    if !inter.is_positive() {
+        return;
+    }
+    let uv0 = egui::Pos2::new(
+        (inter.min.x - full.min.x) / full.width(),
+        (inter.min.y - full.min.y) / full.height(),
+    );
+    let uv1 = egui::Pos2::new(
+        (inter.max.x - full.min.x) / full.width(),
+        (inter.max.y - full.min.y) / full.height(),
+    );
+    painter.image(
+        tex,
+        inter,
+        egui::Rect::from_min_max(uv0, uv1),
+        egui::Color32::WHITE,
+    );
 }
 
 /// 下载瓦片并写磁盘缓存；已缓存直接命中。返回详细错误原因供诊断。
