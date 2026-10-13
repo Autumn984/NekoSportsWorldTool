@@ -126,26 +126,38 @@ impl MapState {
             self.offset += d;
             self.dragged = true;
         }
-        let zoom_factor = if scroll != 0.0 {
-            Some(1.0 + (scroll / 50.0) * 0.5)
+        // 缩放增量（级别）：滚轮每档 0.5 级；捏合按比例换算成级别 log2(ratio)
+        let delta_zoom = if scroll != 0.0 {
+            (scroll / 50.0) * 0.5
         } else if (zoom_gesture - 1.0).abs() > 1e-4 {
-            Some(zoom_gesture)
+            zoom_gesture.log2()
         } else {
-            None
+            0.0
         };
-        if let Some(factor) = zoom_factor {
+        if delta_zoom.abs() > 1e-4 {
             if let Some(pos) = pointer.filter(|p| rect.contains(*p)) {
-                // 指针下的地理点保持不动：offset 补偿世界像素变化
-                let _ = pos;
-                let old_world = self.world();
-                self.zoom = (self.zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
-                let new_world = self.world();
-                self.offset.x += (new_world.0 - old_world.0) as f32;
-                self.offset.y += (new_world.1 - old_world.1) as f32;
+                self.zoom_at(rect, pos, delta_zoom);
             } else {
-                self.zoom = (self.zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
+                self.zoom = (self.zoom + delta_zoom).clamp(ZOOM_MIN, ZOOM_MAX);
             }
         }
+    }
+
+    /// 按级别增量缩放，并保持 rect 内 pos 处的地理点屏幕位置不动。
+    pub fn zoom_at(&mut self, rect: Rect, pos: Pos2, delta: f32) {
+        let zoom_new = (self.zoom + delta).clamp(ZOOM_MIN, ZOOM_MAX);
+        let c = rect.center();
+        let (wx, wy) = self.world();
+        let z_old = self.zoom as f64;
+        let z_new = zoom_new as f64;
+        let sc = 2f64.powf(z_new - z_old);
+        // 指针下地理点（旧级别世界像素）
+        let gx = wx + (pos.x as f64 - c.x as f64) - self.offset.x as f64;
+        let gy = wy + (pos.y as f64 - c.y as f64) - self.offset.y as f64;
+        let (wx2, wy2) = lonlat_to_world(self.center.1, self.center.0, z_new);
+        self.offset.x += ((gx - wx) - (gx * sc - wx2)) as f32;
+        self.offset.y += ((gy - wy) - (gy * sc - wy2)) as f32;
+        self.zoom = zoom_new;
     }
 
     /// 以画布中心缩放（放大/缩小按钮用，每级 +delta）。
@@ -243,6 +255,34 @@ pub fn collect_bounds(edges: &[Vec<(f64, f64)>]) -> Vec<(f64, f64)> {
         }
     }
     pts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 缩放补偿：rect 内 pos 处的地理点在缩放前后屏幕位置不变。
+    #[test]
+    fn zoom_at_keeps_pointer_geo_point_fixed() {
+        let mut m = MapState::default();
+        m.center = (38.90, 121.54);
+        m.zoom = 15.0;
+        m.offset = Vec2::new(33.0, -17.0);
+        let rect = Rect::from_min_max(Pos2::new(8.0, 380.0), Pos2::new(352.0, 784.0));
+        let pos = Pos2::new(220.0, 600.0);
+        let geo_before = m.to_lonlat(rect, pos);
+        for delta in [0.5, -0.25, 1.0, -1.0] {
+            m.zoom_at(rect, pos, delta);
+            let p_after = m.to_screen(rect, geo_before.0, geo_before.1);
+            assert!(
+                (p_after - pos).length() < 0.01,
+                "delta={delta} p_after={p_after:?} pos={pos:?}"
+            );
+        }
+        // 缩放级别确实变化且被钳制
+        assert!(m.zoom > 15.0);
+        assert!(m.zoom <= ZOOM_MAX);
+    }
 }
 
 /// 地图图例：颜色方块 + 说明文字。

@@ -37,6 +37,10 @@ pub struct DrawPage {
     /// 触控跟踪：本设备不投递 Touch(Start)，用首个已知位置 + 移动距离判定点击。
     pub touch_track: Option<Pos2>,
     pub touch_moved: bool,
+    /// 双指捏合跟踪：活动触点 + 上一帧的捏合距离/中点。
+    pub touches: std::collections::HashMap<u64, Pos2>,
+    pub last_pinch_dist: Option<f32>,
+    pub last_pinch_mid: Option<Pos2>,
 }
 
 impl Default for DrawPage {
@@ -53,6 +57,9 @@ impl Default for DrawPage {
             mode: DrawMode::Browse,
             touch_track: None,
             touch_moved: false,
+            touches: std::collections::HashMap::new(),
+            last_pinch_dist: None,
+            last_pinch_mid: None,
         }
     }
 }
@@ -211,8 +218,10 @@ impl App {
             self.draw_page.map.offset,
             canvas,
         );
-        // 浏览模式：平移/缩放；标点模式：不平移，点击加点
-        if self.draw_page.mode == DrawMode::Browse {
+        // 浏览模式：平移/缩放；标点模式：不平移，点击加点。
+        // 双指捏合进行中时跳过 egui 拖拽（由下方捏合逻辑接管，避免双重移动）。
+        let pinch_active = self.draw_page.touches.len() >= 2;
+        if self.draw_page.mode == DrawMode::Browse && !pinch_active {
             self.draw_page.map.interact(ui, canvas);
         }
 
@@ -236,6 +245,32 @@ impl App {
                     } => {
                         self.draw_page.touch_track = Some(*pos);
                         self.draw_page.touch_moved = false;
+                    }
+                    egui::Event::Touch {
+                        id,
+                        phase: egui::TouchPhase::Start,
+                        pos,
+                        ..
+                    }
+                    | egui::Event::Touch {
+                        id,
+                        phase: egui::TouchPhase::Move,
+                        pos,
+                        ..
+                    } => {
+                        self.draw_page.touches.insert(id.0, *pos);
+                    }
+                    egui::Event::Touch {
+                        id,
+                        phase: egui::TouchPhase::End,
+                        ..
+                    }
+                    | egui::Event::Touch {
+                        id,
+                        phase: egui::TouchPhase::Cancel,
+                        ..
+                    } => {
+                        self.draw_page.touches.remove(&id.0);
                     }
                     egui::Event::Touch {
                         phase: egui::TouchPhase::Move,
@@ -269,6 +304,30 @@ impl App {
                 }
             }
         });
+        // 双指捏合：两指距离比 → 缩放，中点位移 → 平移（不依赖 egui zoom_delta，
+        // 本设备的触控事件只有 Touch 流，捏合自行计算）。
+        if self.draw_page.touches.len() >= 2 {
+            let mut pts: Vec<Pos2> = self.draw_page.touches.values().copied().collect();
+            pts.sort_by(|a, b| a.x.total_cmp(&b.x));
+            let (a, b) = (pts[0], pts[1]);
+            let dist = (b - a).length();
+            let mid = Pos2::new((a.x + b.x) * 0.5, (a.y + b.y) * 0.5);
+            if let (Some(pd), Some(pm)) = (self.draw_page.last_pinch_dist, self.draw_page.last_pinch_mid) {
+                if pd > 4.0 {
+                    let ratio = (dist / pd).clamp(0.3, 3.0);
+                    let delta = ratio.log2();
+                    if delta.abs() > 0.005 {
+                        self.draw_page.map.zoom_at(canvas, mid, delta);
+                    }
+                    self.draw_page.map.offset += mid - pm;
+                }
+            }
+            self.draw_page.last_pinch_dist = Some(dist);
+            self.draw_page.last_pinch_mid = Some(mid);
+        } else {
+            self.draw_page.last_pinch_dist = None;
+            self.draw_page.last_pinch_mid = None;
+        }
         if self.draw_page.mode == DrawMode::Mark {
             if let Some(pos) = release_pos {
                 // 仅在抬起帧判定并重置：touch_moved 在移动帧与抬起帧之间保持锁存
