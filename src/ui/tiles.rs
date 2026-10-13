@@ -60,21 +60,32 @@ pub struct TileState {
     order: Vec<TileKey>,
     pending: HashSet<TileKey>,
     failed: HashSet<TileKey>,
+    attempts: HashMap<TileKey, (u32, std::time::Instant)>,
+    /// 诊断：已加载纹理数。
+    pub loaded: u32,
+    /// 诊断：累计失败次数。
+    pub failed_total: u32,
+    /// 诊断：最近一次失败原因。
+    pub last_error: Option<String>,
     req_tx: std::sync::mpsc::Sender<TileKey>,
-    done_rx: std::sync::mpsc::Receiver<(TileKey, bool)>,
+    done_rx: std::sync::mpsc::Receiver<(TileKey, Result<(), String>)>,
 }
+
+/// 失败重试间隔与上限。
+const RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+const MAX_ATTEMPTS: u32 = 4;
 
 impl TileState {
     /// 创建状态并启动下载线程。
     pub fn new() -> Self {
         let (req_tx, req_rx) = std::sync::mpsc::channel::<TileKey>();
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<(TileKey, bool)>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<(TileKey, Result<(), String>)>();
         std::thread::Builder::new()
             .name("tile-fetch".into())
             .spawn(move || {
                 while let Ok(key) = req_rx.recv() {
-                    let ok = fetch_tile(key);
-                    if done_tx.send((key, ok)).is_err() {
+                    let res = fetch_tile(key);
+                    if done_tx.send((key, res)).is_err() {
                         return;
                     }
                 }
@@ -85,6 +96,10 @@ impl TileState {
             order: Vec::new(),
             pending: HashSet::new(),
             failed: HashSet::new(),
+            attempts: HashMap::new(),
+            loaded: 0,
+            failed_total: 0,
+            last_error: None,
             req_tx,
             done_rx,
         }
@@ -92,46 +107,62 @@ impl TileState {
 
     /// 帧内调用：收取下载完成的瓦片并加载为纹理。
     pub fn poll(&mut self, ctx: &egui::Context) {
-        while let Ok((key, ok)) = self.done_rx.try_recv() {
+        while let Ok((key, res)) = self.done_rx.try_recv() {
             self.pending.remove(&key);
-            if !ok {
-                self.failed.insert(key);
-                continue;
-            }
-            let path = cache_path(key);
-            let bytes = match std::fs::read(&path) {
-                Ok(b) => b,
-                Err(_) => {
-                    self.failed.insert(key);
-                    continue;
+            match res {
+                Ok(()) => {
+                    let path = cache_path(key);
+                    let bytes = match std::fs::read(&path) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            self.mark_failed(key, format!("读缓存失败: {e}"));
+                            continue;
+                        }
+                    };
+                    let img = match image::load_from_memory(&bytes) {
+                        Ok(img) => img.to_rgba8(),
+                        Err(e) => {
+                            self.mark_failed(key, format!("解码失败: {e}"));
+                            continue;
+                        }
+                    };
+                    let (w, h) = (img.width() as usize, img.height() as usize);
+                    let color = egui::ColorImage::from_rgba_unmultiplied([w, h], img.as_raw());
+                    let tex = ctx.load_texture(
+                        format!("tile{}_{}_{}", key.z, key.x, key.y),
+                        color,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    if let Some(old) = self.textures.insert(key, tex) {
+                        let _ = old; // 旧纹理由 egui 延迟回收
+                    }
+                    self.order.push(key);
+                    while self.order.len() > MAX_TILES {
+                        let old_key = self.order.remove(0);
+                        self.textures.remove(&old_key);
+                    }
+                    self.loaded += 1;
                 }
-            };
-            let img = match image::load_from_memory(&bytes) {
-                Ok(img) => img.to_rgba8(),
-                Err(_) => {
-                    self.failed.insert(key);
-                    continue;
-                }
-            };
-            let (w, h) = (img.width() as usize, img.height() as usize);
-            let color = egui::ColorImage::from_rgba_unmultiplied([w, h], img.as_raw());
-            let tex = ctx.load_texture(
-                format!("tile{}_{}_{}", key.z, key.x, key.y),
-                color,
-                egui::TextureOptions::LINEAR,
-            );
-            if let Some(old) = self.textures.insert(key, tex) {
-                let _ = old; // 旧纹理由 egui 延迟回收
-            }
-            self.order.push(key);
-            while self.order.len() > MAX_TILES {
-                let old_key = self.order.remove(0);
-                self.textures.remove(&old_key);
+                Err(e) => self.mark_failed(key, e),
             }
         }
     }
 
-    /// 请求当前视野内的缺失瓦片（防重复/防失败重试）。
+    fn mark_failed(&mut self, key: TileKey, reason: String) {
+        self.failed.insert(key);
+        self.failed_total += 1;
+        self.last_error = Some(format!("{}/{}/{}: {}", key.z, key.x, key.y, reason));
+    }
+
+    /// 清空失败/等待状态（「重试瓦片」按钮用）。
+    pub fn reset_errors(&mut self) {
+        self.failed.clear();
+        self.pending.clear();
+        self.attempts.clear();
+        self.last_error = None;
+    }
+
+    /// 请求当前视野内的缺失瓦片（防重复；失败瓦片 30s 后重试，最多 4 次）。
     pub fn request_visible(
         &mut self,
         center: (f64, f64),
@@ -150,6 +181,7 @@ impl TileState {
         let n = (rect.width() as f64 / TILE_PX).ceil() as i64 + 2;
         let m = (rect.height() as f64 / TILE_PX).ceil() as i64 + 2;
         let max_tile = (1i64 << zt) - 1;
+        let now = std::time::Instant::now();
         for dy in 0..m {
             for dx in 0..n {
                 let x = x0 + dx;
@@ -158,12 +190,21 @@ impl TileState {
                     continue;
                 }
                 let key = TileKey { z: zt, x: x as u32, y: y as u32 };
-                if self.textures.contains_key(&key)
-                    || self.pending.contains(&key)
-                    || self.failed.contains(&key)
-                {
+                if self.textures.contains_key(&key) || self.pending.contains(&key) {
                     continue;
                 }
+                if self.failed.contains(&key) {
+                    let entry = self.attempts.entry(key).or_insert((0, now));
+                    if entry.0 >= MAX_ATTEMPTS || now.duration_since(entry.1) < RETRY_AFTER {
+                        continue;
+                    }
+                    entry.1 = now;
+                    self.failed.remove(&key);
+                }
+                self.attempts
+                    .entry(key)
+                    .and_modify(|(c, _)| *c += 1)
+                    .or_insert((1, now));
                 self.pending.insert(key);
                 if self.req_tx.send(key).is_err() {
                     self.pending.remove(&key);
@@ -223,11 +264,11 @@ impl TileState {
     }
 }
 
-/// 下载瓦片并写磁盘缓存；已缓存直接命中。
-fn fetch_tile(key: TileKey) -> bool {
+/// 下载瓦片并写磁盘缓存；已缓存直接命中。返回详细错误原因供诊断。
+fn fetch_tile(key: TileKey) -> Result<(), String> {
     let path = cache_path(key);
     if path.is_file() {
-        return true;
+        return Ok(());
     }
     let agent = ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(12))
@@ -239,22 +280,22 @@ fn fetch_tile(key: TileKey) -> bool {
         .call()
     {
         Ok(r) => r,
-        Err(_) => return false,
+        Err(e) => return Err(format!("请求失败: {}", crate::api::client::ureq_err(e))),
     };
     let mut r = resp.into_reader();
     let mut bytes = Vec::new();
     if std::io::Read::read_to_end(&mut r, &mut bytes).is_err() || bytes.len() < 200 {
-        return false;
+        return Err(format!("响应过短（{} 字节）", bytes.len()));
     }
     // 校验是合法 PNG（高德越界瓦片返回小图或非图数据）
     if bytes.len() < 4 || &bytes[0..4] != b"\x89PNG" {
-        return false;
+        return Err("响应不是 PNG".into());
     }
     let dir = path.parent().unwrap().to_path_buf();
     if std::fs::create_dir_all(&dir).is_err() {
-        return false;
+        return Err("创建缓存目录失败".into());
     }
-    std::fs::write(&path, &bytes).is_ok()
+    std::fs::write(&path, &bytes).map_err(|e| format!("写缓存失败: {e}"))
 }
 
 #[cfg(test)]

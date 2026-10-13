@@ -134,6 +134,31 @@ impl MapState {
         }
     }
 
+    /// 填充线段：沿线段放置重叠小方块（本机 Android/Mali 上除 rect/image/text
+    /// 外的形状渲染异常，rect_filled 稳定可用）。
+    fn fill_segment(&self, painter: &egui::Painter, rect: Rect, a: (f64, f64), b: (f64, f64), color: Color32, width: f32) {
+        let pa = self.to_screen(rect, a.0, a.1);
+        let pb = self.to_screen(rect, b.0, b.1);
+        let d = pb - pa;
+        let len = d.length();
+        if len < 0.5 {
+            return;
+        }
+        let w = width.max(2.0);
+        let step = (w * 0.5).max(1.0);
+        let size = egui::Vec2::splat(w);
+        let mut t = 0.0f32;
+        while t <= len {
+            let c = pa + d * (t / len);
+            painter.rect_filled(
+                egui::Rect::from_center_size(c, size),
+                egui::Rounding::same(w * 0.3),
+                color,
+            );
+            t += step;
+        }
+    }
+
     pub fn draw_polyline(
         &self,
         painter: &egui::Painter,
@@ -145,11 +170,9 @@ impl MapState {
         if pts.len() < 2 {
             return;
         }
-        let ps: Vec<Pos2> = pts
-            .iter()
-            .map(|(la, lo)| self.to_screen(rect, *la, *lo))
-            .collect();
-        painter.add(egui::Shape::line(ps, Stroke::new(width, color)));
+        for w in pts.windows(2) {
+            self.fill_segment(painter, rect, w[0], w[1], color, width);
+        }
     }
 
     pub fn draw_polygon(
@@ -163,12 +186,13 @@ impl MapState {
         if pts.len() < 3 {
             return;
         }
-        let mut ps: Vec<Pos2> = pts
-            .iter()
-            .map(|(la, lo)| self.to_screen(rect, *la, *lo))
-            .collect();
-        ps.push(ps[0]);
-        painter.add(egui::Shape::closed_line(ps, Stroke::new(width, color)));
+        // 逐边填充四边形（闭合轮廓）
+        let n = pts.len();
+        for i in 0..n {
+            let a = pts[i];
+            let b = pts[(i + 1) % n];
+            self.fill_segment(painter, rect, a, b, color, width);
+        }
     }
 
     pub fn draw_point(
@@ -181,7 +205,12 @@ impl MapState {
         radius: f32,
     ) {
         let c = self.to_screen(rect, lat, lon);
-        painter.circle_filled(c, radius, color);
+        // 填充方块代替圆点（本机 Android 上描边/圆形渲染异常，填充正常）
+        painter.rect_filled(
+            egui::Rect::from_center_size(c, egui::Vec2::splat((radius * 2.0).max(4.0))),
+            egui::Rounding::same(2.0),
+            color,
+        );
     }
 }
 

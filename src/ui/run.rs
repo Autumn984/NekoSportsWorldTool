@@ -405,7 +405,7 @@ impl App {
                 ui.label("人脸校验标记：");
                 ui.checkbox(&mut page.face_check, "faceCheck=1");
             });
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("路线算法：");
                 ui.selectable_value(&mut page.route_mode, RouteMode::Legacy, "经典打卡点环");
                 ui.selectable_value(&mut page.route_mode, RouteMode::Road, "真实道路路由");
@@ -417,9 +417,11 @@ impl App {
             });
             if page.route_mode == RouteMode::Drawn {
                 let len = crate::track::custom::load_drawn_route()
-                    .map(|d| {
-                        super::draw::polyline_length(&d.points_gcj, d.auto_close)
+                    .and_then(|d| {
+                        crate::track::custom::ring_from_gcj_polyline(&d.points_gcj, d.auto_close)
+                            .ok()
                     })
+                    .map(|ring| ring.total_length_m)
                     .unwrap_or(0.0);
                 if len > 0.0 {
                     ui.colored_label(

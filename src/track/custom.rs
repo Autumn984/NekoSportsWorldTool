@@ -72,6 +72,9 @@ fn drawn_route_path() -> std::path::PathBuf {
 }
 
 pub fn save_drawn_route(points_gcj: &[(f64, f64)], auto_close: bool) -> Result<(), String> {
+    if points_gcj.len() < 2 {
+        return Err("手绘路线至少需要 2 个点".into());
+    }
     let doc = DrawnRouteFile {
         points_gcj: points_gcj.to_vec(),
         auto_close,
@@ -89,7 +92,8 @@ pub fn load_drawn_route() -> Option<DrawnRouteFile> {
     Some(doc)
 }
 
-/// 由 GCJ-02 折线构建闭环（BD-09）：auto_close 时补上闭合段；开链按单程处理。
+/// 由 GCJ-02 标定点构建平滑闭环（BD-09）：标定点经 Catmull-Rom 拟合成自然曲线；
+/// auto_close 时首尾相接成环，开链按单程处理。
 pub fn ring_from_gcj_polyline(
     points_gcj: &[(f64, f64)],
     auto_close: bool,
@@ -97,7 +101,12 @@ pub fn ring_from_gcj_polyline(
     if points_gcj.len() < 2 {
         return Err("手绘路线至少需要 2 个点".into());
     }
-    let mut pts: Vec<(f64, f64)> = points_gcj.to_vec();
+    let raw_bd: Vec<(f64, f64)> = points_gcj
+        .iter()
+        .map(|&(la, lo)| crate::track::geom::gcj02_to_bd09(la, lo))
+        .collect();
+    // 平滑：每段 12 采样，闭环时补首点闭合
+    let mut pts = crate::track::geom::smooth_polyline(&raw_bd, 12, auto_close);
     if auto_close && pts.len() > 2 {
         let first = pts[0];
         let last = *pts.last().unwrap();
@@ -114,12 +123,8 @@ pub fn ring_from_gcj_polyline(
     if length <= 0.0 {
         return Err("手绘路线长度无效（0 米）".into());
     }
-    let points_bd: Vec<(f64, f64)> = pts
-        .iter()
-        .map(|&(la, lo)| crate::track::geom::gcj02_to_bd09(la, lo))
-        .collect();
     Ok(CustomRing {
-        points_bd,
+        points_bd: pts,
         leg_length_m: length,
         total_length_m: length,
         loop_mode: auto_close,
@@ -600,5 +605,23 @@ mod tests {
                 assert!((141.0..=600.0).contains(&pace), "seed={seed} 配速越界 {pace}");
             }
         }
+    }
+
+    /// 平滑折线：闭环补首点、开链端点不动、采样数正确。
+    #[test]
+    fn test_smooth_polyline_geometry() {
+        let pts = vec![(38.90, 121.54), (38.91, 121.55), (38.905, 121.545)];
+        let sm = crate::track::geom::smooth_polyline(&pts, 12, true);
+        assert_eq!(sm.len(), 3 * 12 + 1, "闭环 = 段数×采样 + 闭合点");
+        assert_eq!(sm[0], sm[sm.len() - 1]);
+        let sm2 = crate::track::geom::smooth_polyline(&pts, 12, false);
+        assert_eq!(sm2.len(), 2 * 12);
+        assert!((sm2[0].0 - pts[0].0).abs() < 1e-9 && (sm2[0].1 - pts[0].1).abs() < 1e-9);
+        let last = sm2[sm2.len() - 1];
+        assert!((last.0 - pts[2].0).abs() < 1e-9 && (last.1 - pts[2].1).abs() < 1e-9);
+        // 平滑环长度应大于两点直线距离的粗糙下界（非退化）
+        let ring = ring_from_gcj_polyline(&pts, true).unwrap();
+        assert!(ring.total_length_m > 1000.0, "len={}", ring.total_length_m);
+        assert!(ring.points_bd.len() >= 37);
     }
 }
