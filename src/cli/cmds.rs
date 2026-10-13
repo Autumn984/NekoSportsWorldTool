@@ -222,16 +222,48 @@ fn cmd_run(rest: &[&str]) -> i32 {
 }
 
 /// 自定义路线预览：只调高德接口，不登录、不访问学校服务器、不提交。
-/// --out 可导出 GPX（GCJ-02 坐标）供外部查看。
+/// --drawn 预览已保存的手绘路线（drawn_route.json）。--out 可导出 GPX（GCJ-02）。
 fn cmd_route(rest: &[&str]) -> i32 {
     let flags = parse_flags(rest);
     let cfg = model::load_config();
     let key = get(&flags, "amap-key")
         .map(|v| v.to_string())
         .unwrap_or_else(|| cfg.amap_key.clone());
+    if get(&flags, "drawn").is_some() {
+        let Some(doc) = crate::track::custom::load_drawn_route() else {
+            eprintln!("未找到手绘路线（drawn_route.json），请先在手绘页绘制并保存");
+            return 1;
+        };
+        return match crate::track::custom::ring_from_gcj_polyline(&doc.points_gcj, doc.auto_close) {
+            Ok(ring) => {
+                println!("手绘路线预览（仅本地，不上传）");
+                println!(
+                    "模式：{}",
+                    if ring.loop_mode { "绕圈闭合" } else { "单程开链" }
+                );
+                println!(
+                    "全长：{:.0} m（{} 个点）",
+                    ring.total_length_m,
+                    ring.points_bd.len()
+                );
+                if let Some(out) = get(&flags, "out") {
+                    if let Err(e) = write_gpx(out, &ring) {
+                        eprintln!("GPX 导出失败: {e}");
+                        return 1;
+                    }
+                    println!("GPX 已导出 {out}（GCJ-02）");
+                }
+                0
+            }
+            Err(e) => {
+                eprintln!("手绘路线无效: {e}");
+                1
+            }
+        };
+    }
     let (Some(origin), Some(destination)) = (get(&flags, "origin"), get(&flags, "destination"))
     else {
-        eprintln!("缺少 --origin / --destination（地址或 经度,纬度 坐标）");
+        eprintln!("缺少 --origin / --destination（地址或 经度,纬度 坐标）；或使用 --drawn 预览手绘路线");
         return 1;
     };
     let spec = crate::track::custom::CustomRouteSpec {

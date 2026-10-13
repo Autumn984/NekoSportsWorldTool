@@ -58,6 +58,74 @@ pub struct CustomRing {
     pub loop_mode: bool,
 }
 
+/// 手绘路线存档（drawn_route.json，GCJ-02，与高德瓦片同基准）。
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct DrawnRouteFile {
+    /// 途经点（GCJ-02，lat, lng）。
+    pub points_gcj: Vec<(f64, f64)>,
+    /// 是否首尾闭合（绕圈）。
+    pub auto_close: bool,
+}
+
+fn drawn_route_path() -> std::path::PathBuf {
+    crate::platform::data_dir().join("drawn_route.json")
+}
+
+pub fn save_drawn_route(points_gcj: &[(f64, f64)], auto_close: bool) -> Result<(), String> {
+    let doc = DrawnRouteFile {
+        points_gcj: points_gcj.to_vec(),
+        auto_close,
+    };
+    let json = serde_json::to_string_pretty(&doc).map_err(|e| format!("序列化失败: {e}"))?;
+    std::fs::write(drawn_route_path(), json).map_err(|e| format!("写入失败: {e}"))
+}
+
+pub fn load_drawn_route() -> Option<DrawnRouteFile> {
+    let text = std::fs::read_to_string(drawn_route_path()).ok()?;
+    let doc: DrawnRouteFile = serde_json::from_str(&text).ok()?;
+    if doc.points_gcj.len() < 2 {
+        return None;
+    }
+    Some(doc)
+}
+
+/// 由 GCJ-02 折线构建闭环（BD-09）：auto_close 时补上闭合段；开链按单程处理。
+pub fn ring_from_gcj_polyline(
+    points_gcj: &[(f64, f64)],
+    auto_close: bool,
+) -> Result<CustomRing, String> {
+    if points_gcj.len() < 2 {
+        return Err("手绘路线至少需要 2 个点".into());
+    }
+    let mut pts: Vec<(f64, f64)> = points_gcj.to_vec();
+    if auto_close && pts.len() > 2 {
+        let first = pts[0];
+        let last = *pts.last().unwrap();
+        if (first.0 - last.0).abs() > 1e-9 || (first.1 - last.1).abs() > 1e-9 {
+            pts.push(first);
+        }
+    }
+    let mut length = 0.0;
+    for w in pts.windows(2) {
+        let dlat = (w[0].0 - w[1].0) * crate::track::geom::MET_PER_DEG_LAT;
+        let dlng = (w[0].1 - w[1].1) * crate::track::geom::MET_PER_DEG_LNG;
+        length += (dlat * dlat + dlng * dlng).sqrt();
+    }
+    if length <= 0.0 {
+        return Err("手绘路线长度无效（0 米）".into());
+    }
+    let points_bd: Vec<(f64, f64)> = pts
+        .iter()
+        .map(|&(la, lo)| crate::track::geom::gcj02_to_bd09(la, lo))
+        .collect();
+    Ok(CustomRing {
+        points_bd,
+        leg_length_m: length,
+        total_length_m: length,
+        loop_mode: auto_close,
+    })
+}
+
 /// 按绕圈/单程/圈数计算本次实际距离与时长，返回 (距离, 时长, 说明日志)。
 ///
 /// 平均速度沿用调用方已校正到有效配速窗口内的 dist/dur 比值，

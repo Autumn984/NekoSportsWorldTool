@@ -11,6 +11,7 @@ pub mod about;
 pub mod ai;
 pub mod data;
 pub mod device;
+pub mod draw;
 pub mod fonts;
 pub mod jobs;
 pub mod log;
@@ -21,6 +22,7 @@ pub mod osm;
 pub mod records;
 pub mod run;
 pub mod theme;
+pub mod tiles;
 pub mod user;
 
 use crate::api::model::{self, Config, HeaderIdentity, Session};
@@ -92,6 +94,10 @@ pub struct App {
     /// 已加载的 OSM 路网（真实道路路由 + 地图显示共用）。
     pub network: Option<Arc<route_planner::RoadGraph>>,
     pub osm_page: osm::OsmPage,
+    /// 地图瓦片（高德底图 + 缓存）。
+    pub tiles: tiles::TileState,
+    /// 手绘路线页。
+    pub draw_page: draw::DrawPage,
     net_tx: Sender<Result<Arc<route_planner::RoadGraph>, String>>,
     net_rx: Receiver<Result<Arc<route_planner::RoadGraph>, String>>,
 }
@@ -108,6 +114,7 @@ impl eframe::App for App {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_messages();
+        self.tiles.poll(ctx);
         #[cfg(target_os = "android")]
         self.poll_device_info();
         crate::platform::set_keep_screen_on(self.run_busy || self.ai_busy || self.login_busy);
@@ -277,6 +284,7 @@ impl eframe::App for App {
                 5 => self.draw_device(ui),
                 6 => self.log.render(ui),
                 7 => self.draw_osm_page(ui),
+                8 => self.draw_draw_page(ui),
                 _ => self.draw_about(ui),
             }
         });
@@ -388,6 +396,11 @@ impl App {
             network: None,
             osm_page: osm::OsmPage {
                 path: config.osm_path.clone(),
+                ..Default::default()
+            },
+            tiles: tiles::TileState::new(),
+            draw_page: draw::DrawPage {
+                auto_close: true,
                 ..Default::default()
             },
             net_tx,

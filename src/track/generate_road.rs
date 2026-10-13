@@ -20,7 +20,7 @@ use route_planner::{
     Coord, GpsJitter, KinParams, RoadGraph, Route, RouteOptions, Sdf,
 };
 
-/// 路线算法模式（三选一）。
+/// 路线算法模式（四选一）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum RouteMode {
     /// 经典打卡点环（Catmull-Rom）。
@@ -30,6 +30,8 @@ pub enum RouteMode {
     Road,
     /// 自定义路线（高德步行路径）。
     Custom,
+    /// 手绘路线（地图点选路径，drawn_route.json）。
+    Drawn,
 }
 
 impl RouteMode {
@@ -37,6 +39,7 @@ impl RouteMode {
         match s {
             "road" => RouteMode::Road,
             "custom" => RouteMode::Custom,
+            "drawn" => RouteMode::Drawn,
             _ => RouteMode::Legacy,
         }
     }

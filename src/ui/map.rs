@@ -1,29 +1,37 @@
-//! 地图画布绘制原语：等距投影 + 拖拽平移 + 滚轮缩放。
+//! 地图画布：Web Mercator 投影 + 高德瓦片底图 + 拖拽平移 + 滚轮缩放（以指针为中心）。
 //!
-//! 供「路网」页与「跑步」页复用，纯离线绘制折线/多边形/点。
+//! 供「路网」页 /「跑步」页 /「手绘」页复用。**所有坐标为 GCJ-02**（与高德瓦片对齐）；
+//! 应用内部 BD-09 数据在绘制前需经 `bd09_to_gcj02_display` 转换。
 
 use eframe::egui;
 use egui::{Color32, Pos2, Rect, Stroke, Vec2};
 
-use crate::track::geom::{MET_PER_DEG_LAT, MET_PER_DEG_LNG};
+use super::tiles::{lonlat_to_world, world_to_lonlat, ZOOM_MAX, ZOOM_MIN};
 
-/// 地图视图状态（世界坐标为度）。
+/// BD-09 → GCJ-02 显示转换（轨迹/打卡点/路网等内部 BD 数据上地图前调用）。
+pub fn bd09_to_gcj02_display(pts: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    pts.iter()
+        .map(|&(la, lo)| crate::track::wire::bd09_to_gcj02(la, lo))
+        .collect()
+}
+
+/// 地图视图状态（世界坐标 GCJ-02）。
 pub struct MapState {
-    /// 参考中心（lat, lon）。
+    /// 参考中心（lat, lon）GCJ-02。
     pub center: (f64, f64),
-    /// 屏幕每米像素（缩放）。
-    pub scale: f32,
+    /// 瓦片缩放级别（可小数，瓦片按 round 后的级别绘制）。
+    pub zoom: f32,
     /// 平移偏移（像素）。
     pub offset: Vec2,
-    /// 最近是否被拖拽过（供外部判断）。
+    /// 最近是否被拖拽过（供外部判断「点击 vs 拖拽」）。
     pub dragged: bool,
 }
 
 impl Default for MapState {
     fn default() -> Self {
         MapState {
-            center: (0.0, 0.0),
-            scale: 0.3,
+            center: (35.0, 105.0),
+            zoom: 5.0,
             offset: Vec2::ZERO,
             dragged: false,
         }
@@ -31,9 +39,38 @@ impl Default for MapState {
 }
 
 impl MapState {
-    /// 依据一组点（lat, lon）自动适配视野。
+    /// 视野中心的世界像素（按当前 zoom）。
+    fn world(&self) -> (f64, f64) {
+        lonlat_to_world(self.center.1, self.center.0, self.zoom as f64)
+    }
+
+    /// 度坐标 → 屏幕坐标。
+    pub fn to_screen(&self, rect: Rect, lat: f64, lon: f64) -> Pos2 {
+        let (wx, wy) = self.world();
+        let (px, py) = lonlat_to_world(lon, lat, self.zoom as f64);
+        let c = rect.center();
+        Pos2::new(
+            (c.x as f64 + (px - wx) + self.offset.x as f64) as f32,
+            (c.y as f64 + (py - wy) + self.offset.y as f64) as f32,
+        )
+    }
+
+    /// 屏幕坐标 → 度坐标 (lat, lon)。
+    pub fn to_lonlat(&self, rect: Rect, pos: Pos2) -> (f64, f64) {
+        let (wx, wy) = self.world();
+        let c = rect.center();
+        let px = wx + (pos.x as f64 - c.x as f64) - self.offset.x as f64;
+        let py = wy + (pos.y as f64 - c.y as f64) - self.offset.y as f64;
+        world_to_lonlat(px, py, self.zoom as f64)
+    }
+
+    /// 依据一组点（lat, lon，GCJ-02）自动适配视野。
     pub fn fit(&mut self, rect: Rect, pts: &[(f64, f64)]) {
         if pts.len() < 2 {
+            if let Some(&(la, lo)) = pts.first() {
+                self.center = (la, lo);
+                self.zoom = 16.0;
+            }
             return;
         }
         let (mut slat, mut slon) = (0.0f64, 0.0f64);
@@ -43,6 +80,7 @@ impl MapState {
         }
         let n = pts.len() as f64;
         self.center = (slat / n, slon / n);
+        // zoom 0 下的世界像素跨度
         let (mut minx, mut maxx, mut miny, mut maxy) = (
             f64::INFINITY,
             f64::NEG_INFINITY,
@@ -50,43 +88,32 @@ impl MapState {
             f64::NEG_INFINITY,
         );
         for (la, lo) in pts {
-            let x = (lo - self.center.1) * MET_PER_DEG_LNG;
-            let y = (la - self.center.0) * MET_PER_DEG_LAT;
+            let (x, y) = lonlat_to_world(*lo, *la, 0.0);
             minx = minx.min(x);
             maxx = maxx.max(x);
             miny = miny.min(y);
             maxy = maxy.max(y);
         }
-        let w = (maxx - minx).max(40.0);
-        let h = (maxy - miny).max(40.0);
-        let sx = rect.width() as f64 / w;
-        let sy = rect.height() as f64 / h;
-        self.scale = ((sx.min(sy)) * 0.92) as f32;
+        let w = (maxx - minx).max(1e-9);
+        let h = (maxy - miny).max(1e-9);
+        let zx = ((rect.width() as f64 * 0.92) / w).log2();
+        let zy = ((rect.height() as f64 * 0.92) / h).log2();
+        self.zoom = (zx.min(zy) as f32).clamp(ZOOM_MIN, ZOOM_MAX);
         self.offset = Vec2::ZERO;
     }
 
-    /// 度坐标 → 屏幕坐标。
-    pub fn to_screen(&self, rect: Rect, lat: f64, lon: f64) -> Pos2 {
-        let x = (lon - self.center.1) * MET_PER_DEG_LNG * self.scale as f64;
-        let y = -(lat - self.center.0) * MET_PER_DEG_LAT * self.scale as f64;
-        let c = rect.center();
-        Pos2::new(
-            (c.x as f64 + x + self.offset.x as f64) as f32,
-            (c.y as f64 + y + self.offset.y as f64) as f32,
-        )
-    }
-
     /// 处理拖拽/缩放交互（需在分配好 rect 后调用）。
+    /// 缩放以指针位置为中心：指针下的地理点保持不动。
     pub fn interact(&mut self, ui: &egui::Ui, rect: Rect) {
         self.dragged = false;
-        let (drag, scroll) = ui.input(|i| {
+        let (drag, scroll, pointer) = ui.input(|i| {
             let hover = i
                 .pointer
                 .interact_pos()
                 .map(|p| rect.contains(p))
                 .unwrap_or(false);
             let dragging = hover && i.pointer.primary_down() && i.pointer.is_decidedly_dragging();
-            (dragging, i.raw_scroll_delta.y)
+            (dragging, i.raw_scroll_delta.y, i.pointer.interact_pos())
         });
         if drag {
             let d = ui.input(|i| i.pointer.delta());
@@ -94,8 +121,16 @@ impl MapState {
             self.dragged = true;
         }
         if scroll != 0.0 {
-            let factor = (scroll * 0.0015).exp() as f32;
-            self.scale = (self.scale * factor).clamp(0.002, 200.0);
+            if let Some(pos) = pointer.filter(|p| rect.contains(*p)) {
+                // 指针下的地理点保持不动：offset 补偿世界像素变化
+                let _ = pos;
+                let old_world = self.world();
+                let notches = scroll / 50.0;
+                self.zoom = (self.zoom + notches as f32 * 0.5).clamp(ZOOM_MIN, ZOOM_MAX);
+                let new_world = self.world();
+                self.offset.x += (new_world.0 - old_world.0) as f32;
+                self.offset.y += (new_world.1 - old_world.1) as f32;
+            }
         }
     }
 

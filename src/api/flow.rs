@@ -270,6 +270,20 @@ pub fn run_full_flow(
                 )
             }
         },
+        RouteMode::Drawn => match build_drawn_track(&params, &pol.must_points, &pts_bd, start_ms, log) {
+            Ok(t) => t,
+            Err(e) => {
+                log(&format!("⚠ [track] 手绘路线失败，回退经典算法: {e}"));
+                gen_track(
+                    params.dist,
+                    params.dur,
+                    params.seed,
+                    (anchor.latitude, anchor.longitude),
+                    start_ms,
+                    &pts_bd,
+                )
+            }
+        },
     };
     if let Some(range) = params.manual_altitude_range {
         crate::track::altitude::override_bd_a_range(&mut track, range)?;
@@ -392,10 +406,50 @@ fn build_custom_track(
         ring.points_bd.len(),
         if ring.loop_mode { "绕圈" } else { "单程" }
     ));
+    build_custom_track_with_ring(spec, &ring, params, must_bd, pts_bd, start_ms, log)
+}
+
+/// 手绘路线轨迹生成（模式 D）：读取 drawn_route.json 折线 → 走点 → 吸附与告警。
+fn build_drawn_track(
+    params: &RunParams,
+    must_bd: &[(f64, f64)],
+    pts_bd: &[(f64, f64)],
+    start_ms: i64,
+    log: &mut dyn FnMut(&str),
+) -> Result<crate::track::model::Track, String> {
+    let doc = crate::track::custom::load_drawn_route()
+        .ok_or("未保存手绘路线（请先到「手绘」页绘制并保存）")?;
+    let ring = crate::track::custom::ring_from_gcj_polyline(&doc.points_gcj, doc.auto_close)?;
+    log(&format!(
+        "√ [track] 手绘路线：{} 点 · {:.0} m（{}）",
+        doc.points_gcj.len(),
+        ring.total_length_m,
+        if ring.loop_mode { "绕圈闭合" } else { "单程开链" }
+    ));
+    // 手绘模式的圈数语义与自定义模式一致：loop=laps>0 或按距离自动；开链按单程裁剪
+    let spec = crate::track::custom::CustomRouteSpec {
+        loop_mode: ring.loop_mode,
+        laps: params.custom.as_ref().map(|s| s.laps).unwrap_or(0),
+        ..Default::default()
+    };
+    build_custom_track_with_ring(&spec, &ring, params, must_bd, pts_bd, start_ms, log)
+}
+
+/// 共用走点段：距离/圈数换算 → 轨迹生成 → 必经点/打卡点吸附告警。
+#[allow(clippy::too_many_arguments)]
+fn build_custom_track_with_ring(
+    spec: &crate::track::custom::CustomRouteSpec,
+    ring: &crate::track::custom::CustomRing,
+    params: &RunParams,
+    must_bd: &[(f64, f64)],
+    pts_bd: &[(f64, f64)],
+    start_ms: i64,
+    log: &mut dyn FnMut(&str),
+) -> Result<crate::track::model::Track, String> {
     let (d_eff, dur_eff, note) =
-        crate::track::custom::effective_dist_dur(spec, &ring, params.dist, params.dur)?;
+        crate::track::custom::effective_dist_dur(spec, ring, params.dist, params.dur)?;
     log(&format!("[track] {note} → 距离 {:.0} m / {dur_eff}s", d_eff));
-    let track = crate::track::custom::build_custom(d_eff, dur_eff, params.seed, start_ms, &ring, pts_bd);
+    let track = crate::track::custom::build_custom(d_eff, dur_eff, params.seed, start_ms, ring, pts_bd);
     // 必经点告警：自定义路线不强制改道，必经点不在路线附近时提示可能不计成绩
     for (i, &(mlat, mlon)) in must_bd.iter().enumerate() {
         let mut best = f64::INFINITY;
@@ -406,7 +460,7 @@ fn build_custom_track(
         }
         if best > 40.0 * 40.0 {
             log(&format!(
-                "⚠ [track] 必经点[{i}] 不在自定义路线附近（最近 {:.0} m），本次可能不计入有效成绩",
+                "⚠ [track] 必经点[{i}] 不在路线附近（最近 {:.0} m），本次可能不计入有效成绩",
                 best.sqrt()
             ));
         }

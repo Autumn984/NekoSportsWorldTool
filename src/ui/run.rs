@@ -410,10 +410,26 @@ impl App {
                 ui.selectable_value(&mut page.route_mode, RouteMode::Legacy, "经典打卡点环");
                 ui.selectable_value(&mut page.route_mode, RouteMode::Road, "真实道路路由");
                 ui.selectable_value(&mut page.route_mode, RouteMode::Custom, "自定义路线");
+                ui.selectable_value(&mut page.route_mode, RouteMode::Drawn, "手绘路线");
                 if page.route_mode == RouteMode::Road && self.network.is_none() {
                     ui.colored_label(theme::warn(), "（需先在「路网」页导入 OSM）");
                 }
             });
+            if page.route_mode == RouteMode::Drawn {
+                let len = crate::track::custom::load_drawn_route()
+                    .map(|d| {
+                        super::draw::polyline_length(&d.points_gcj, d.auto_close)
+                    })
+                    .unwrap_or(0.0);
+                if len > 0.0 {
+                    ui.colored_label(
+                        theme::plain(),
+                        format!("手绘路线已保存：{:.0} m（可在「手绘」页修改）", len),
+                    );
+                } else {
+                    ui.colored_label(theme::warn(), "尚未保存手绘路线，请先到「手绘」页绘制");
+                }
+            }
             if page.route_mode == RouteMode::Custom {
                 mobile::row(ui, |ui| {
                     ui.label("高德 Key：");
@@ -642,6 +658,7 @@ impl App {
         );
 
         // 首次预览后适配视野：优先以电子围栏为中点/范围，无围栏时退化为路线+打卡点+道路
+        // （显示层使用 GCJ-02，与高德瓦片对齐）
         if !self.run_page.map_fitted {
             let mut bounds: Vec<(f64, f64)> = Vec::new();
             if let Some(p) = &self.run_page.preview {
@@ -655,41 +672,62 @@ impl App {
                 }
             }
             if !bounds.is_empty() {
-                self.run_page.map.fit(canvas, &bounds);
+                let display = super::map::bd09_to_gcj02_display(&bounds);
+                self.run_page.map.fit(canvas, &display);
                 self.run_page.map_fitted = true;
             }
         }
 
+        // 瓦片底图（BD-09 矢量层绘制前转换到 GCJ-02）
+        self.tiles.request_visible(
+            self.run_page.map.center,
+            self.run_page.map.zoom,
+            self.run_page.map.offset,
+            canvas,
+        );
+        self.tiles.draw(
+            &painter,
+            self.run_page.map.center,
+            self.run_page.map.zoom,
+            self.run_page.map.offset,
+            canvas,
+        );
+
         if let Some(p) = &self.run_page.preview {
-            let road = egui::Color32::from_rgb(200, 208, 204);
+            let road = egui::Color32::from_rgb(120, 128, 124);
             for e in &p.edges {
+                let d = super::map::bd09_to_gcj02_display(e);
                 self.run_page
                     .map
-                    .draw_polyline(&painter, canvas, e, road, 1.0);
+                    .draw_polyline(&painter, canvas, &d, road, 1.0);
             }
             let bld = egui::Color32::from_rgb(224, 194, 170);
             for b in &p.buildings {
+                let d = super::map::bd09_to_gcj02_display(b);
                 self.run_page
                     .map
-                    .draw_polygon(&painter, canvas, b, bld, 1.0);
+                    .draw_polygon(&painter, canvas, &d, bld, 1.0);
             }
             let fence_c = egui::Color32::from_rgb(180, 118, 0);
             for f in &p.fences {
+                let d = super::map::bd09_to_gcj02_display(f);
                 self.run_page
                     .map
-                    .draw_polygon(&painter, canvas, f, fence_c, 2.0);
+                    .draw_polygon(&painter, canvas, &d, fence_c, 2.0);
             }
             let route_c = egui::Color32::from_rgb(30, 111, 216);
+            let route_d = super::map::bd09_to_gcj02_display(&p.route);
             self.run_page
                 .map
-                .draw_polyline(&painter, canvas, &p.route, route_c, 2.5);
+                .draw_polyline(&painter, canvas, &route_d, route_c, 2.5);
             let cp = egui::Color32::from_rgb(240, 180, 0);
-            for &(la, lo) in &p.checkpoints {
+            let cp_d = super::map::bd09_to_gcj02_display(&p.checkpoints);
+            for &(la, lo) in &cp_d {
                 self.run_page
                     .map
                     .draw_point(&painter, canvas, la, lo, cp, 3.5);
             }
-            if let Some(first) = p.route.first() {
+            if let Some(first) = route_d.first() {
                 self.run_page.map.draw_point(
                     &painter,
                     canvas,
@@ -699,7 +737,7 @@ impl App {
                     4.5,
                 );
             }
-            if let Some(last) = p.route.last() {
+            if let Some(last) = route_d.last() {
                 self.run_page.map.draw_point(
                     &painter,
                     canvas,
@@ -794,14 +832,30 @@ impl App {
                 bounds.extend(crate::api::points::points_bd(&pts));
             }
             if !bounds.is_empty() {
-                self.run_page.map.fit(canvas, &bounds);
+                let display = super::map::bd09_to_gcj02_display(&bounds);
+                self.run_page.map.fit(canvas, &display);
                 self.run_page.map_fitted = true;
             }
         }
+        // 瓦片底图 + GCJ-02 转换后的路线/打卡点
+        self.tiles.request_visible(
+            self.run_page.map.center,
+            self.run_page.map.zoom,
+            self.run_page.map.offset,
+            canvas,
+        );
+        self.tiles.draw(
+            &painter,
+            self.run_page.map.center,
+            self.run_page.map.zoom,
+            self.run_page.map.offset,
+            canvas,
+        );
         let route_c = egui::Color32::from_rgb(30, 111, 216);
+        let route_d = super::map::bd09_to_gcj02_display(&ring.points_bd);
         self.run_page
             .map
-            .draw_polyline(&painter, canvas, &ring.points_bd, route_c, 2.5);
+            .draw_polyline(&painter, canvas, &route_d, route_c, 2.5);
         if let Some((_ts, pts)) = self
             .identity
             .anchor_coordinate()
@@ -809,11 +863,12 @@ impl App {
             .and_then(crate::api::model::load_points_cache_for)
         {
             let cp = egui::Color32::from_rgb(240, 180, 0);
-            for (la, lo) in crate::api::points::points_bd(&pts) {
+            let cp_d = super::map::bd09_to_gcj02_display(&crate::api::points::points_bd(&pts));
+            for &(la, lo) in &cp_d {
                 self.run_page.map.draw_point(&painter, canvas, la, lo, cp, 3.0);
             }
         }
-        if let Some(first) = ring.points_bd.first() {
+        if let Some(first) = route_d.first() {
             self.run_page.map.draw_point(
                 &painter,
                 canvas,
@@ -823,7 +878,7 @@ impl App {
                 4.5,
             );
         }
-        if let Some(last) = ring.points_bd.last() {
+        if let Some(last) = route_d.last() {
             self.run_page.map.draw_point(
                 &painter,
                 canvas,
@@ -941,6 +996,7 @@ impl App {
         self.config.route_mode = match route_mode {
             RouteMode::Road => "road".into(),
             RouteMode::Custom => "custom".into(),
+            RouteMode::Drawn => "drawn".into(),
             RouteMode::Legacy => "legacy".into(),
         };
         self.config.amap_key = page.amap_key.trim().to_string();
