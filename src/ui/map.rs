@@ -148,10 +148,10 @@ impl MapState {
         }
     }
 
-    /// 以画布中心缩放（放大/缩小按钮用）。
+    /// 以画布中心缩放（放大/缩小按钮用，每级 +delta）。
     /// 视野中心点始终渲染在 rect.center + offset，因此只需改 zoom。
-    pub fn zoom_around_center(&mut self, factor: f32) {
-        self.zoom = (self.zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
+    pub fn zoom_around_center(&mut self, delta: f32) {
+        self.zoom = (self.zoom + delta).clamp(ZOOM_MIN, ZOOM_MAX);
     }
 
     /// 填充线段：沿线段放置重叠小方块（本机 Android/Mali 上除 rect/image/text

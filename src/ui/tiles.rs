@@ -12,7 +12,8 @@ use std::collections::{HashMap, HashSet};
 pub const TILE_PX: f64 = 256.0;
 pub const MAX_TILES: usize = 256;
 pub const ZOOM_MIN: f32 = 3.0;
-pub const ZOOM_MAX: f32 = 18.0;
+/// 高德 style=7 瓦片最高可用级别（z18 起返回 1×1 空白占位图）。
+pub const ZOOM_MAX: f32 = 17.0;
 
 /// 高德道路瓦片 URL（style=7 路网；子域 1-4 轮换）。
 pub fn amap_tile_url(x: u32, y: u32, z: u32) -> String {
@@ -284,10 +285,10 @@ fn fetch_tile(key: TileKey) -> Result<(), String> {
     };
     let mut r = resp.into_reader();
     let mut bytes = Vec::new();
-    if std::io::Read::read_to_end(&mut r, &mut bytes).is_err() || bytes.len() < 200 {
+    if std::io::Read::read_to_end(&mut r, &mut bytes).is_err() || bytes.len() < 60 {
         return Err(format!("响应过短（{} 字节）", bytes.len()));
     }
-    // 校验是合法 PNG（高德越界瓦片返回小图或非图数据）
+    // 校验是合法 PNG（高德越界瓦片返回小图或非图数据；1×1 空白占位图合法）
     if bytes.len() < 4 || &bytes[0..4] != b"\x89PNG" {
         return Err("响应不是 PNG".into());
     }

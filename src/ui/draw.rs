@@ -114,10 +114,10 @@ impl App {
             ui.selectable_value(&mut self.draw_page.mode, DrawMode::Mark, "标点");
             ui.separator();
             if ui.small_button("放大").clicked() {
-                self.draw_page.map.zoom_around_center(1.4);
+                self.draw_page.map.zoom_around_center(1.0);
             }
             if ui.small_button("缩小").clicked() {
-                self.draw_page.map.zoom_around_center(1.0 / 1.4);
+                self.draw_page.map.zoom_around_center(-1.0);
             }
             ui.separator();
             if ui.small_button("撤销").clicked() {
