@@ -27,8 +27,6 @@ pub struct DrawPage {
     pub fitted: bool,
     pub auto_close: bool,
     pub status: String,
-    /// 点击诊断（临时）
-    pub debug: String,
     /// 悬浮工具栏占据的屏幕区域（用于排除点击）。
     pub toolbar_rect: egui::Rect,
     /// 路线叠加纹理缓存（脏检查）。
@@ -49,7 +47,6 @@ impl Default for DrawPage {
             fitted: false,
             auto_close: false,
             status: String::new(),
-            debug: String::new(),
             toolbar_rect: egui::Rect::NOTHING,
             overlay_fp: (0, 0, 0, 0, 0, 0, 0, 0),
             overlay_tex: None,
@@ -110,21 +107,16 @@ impl App {
         let mut want_retry_tiles = false;
 
         // 工具栏（普通布局，画布上方）
-        let mut btn_diag = String::new();
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().button_padding = egui::vec2(6.0, 3.0);
             ui.label("模式：");
             ui.selectable_value(&mut self.draw_page.mode, DrawMode::Browse, "浏览");
             ui.selectable_value(&mut self.draw_page.mode, DrawMode::Mark, "标点");
             ui.separator();
-            let z1 = ui.small_button("放大");
-            btn_diag.push_str(&format!("放大={:?};", z1.rect));
-            if z1.clicked() {
+            if ui.small_button("放大").clicked() {
                 self.draw_page.map.zoom_around_center(1.4);
             }
-            let z2 = ui.small_button("缩小");
-            btn_diag.push_str(&format!("缩小={:?};", z2.rect));
-            if z2.clicked() {
+            if ui.small_button("缩小").clicked() {
                 self.draw_page.map.zoom_around_center(1.0 / 1.4);
             }
             ui.separator();
@@ -136,25 +128,16 @@ impl App {
                 self.draw_page.status = String::new();
             }
             ui.checkbox(&mut self.draw_page.auto_close, "闭合");
-            let s1 = ui.small_button("保存路线");
-            btn_diag.push_str(&format!("保存={:?};", s1.rect));
-            if s1.clicked() {
+            if ui.small_button("保存路线").clicked() {
                 want_save = true;
             }
-            let g1 = ui.small_button("去跑步");
-            btn_diag.push_str(&format!("去跑步={:?};", g1.rect));
-            if g1.clicked() {
+            if ui.small_button("去跑步").clicked() {
                 want_run_tab = true;
             }
             if ui.small_button("重试瓦片").clicked() {
                 want_retry_tiles = true;
             }
         });
-        let _ = std::fs::create_dir_all("/sdcard/Android/data/org.nekosportsworld.tool/files");
-        let _ = std::fs::write(
-            "/sdcard/Android/data/org.nekosportsworld.tool/files/btn_diag.txt",
-            &btn_diag,
-        );
         let n = self.draw_page.points.len();
         let smooth = if n >= 2 {
             crate::track::geom::smooth_polyline(&self.draw_page.points, 12, self.draw_page.auto_close)
@@ -286,22 +269,15 @@ impl App {
                 }
             }
         });
-        let is_tap = !self.draw_page.touch_moved;
-        let gesture_len = match (self.draw_page.touch_track.take(), release_pos) {
-            (Some(p), Some(r)) => (r - p).length(),
-            _ => 0.0,
-        };
-        self.draw_page.touch_moved = false;
-        let mut add_diag = String::new();
         if self.draw_page.mode == DrawMode::Mark {
             if let Some(pos) = release_pos {
-                add_diag = format!(
-                    "mode=Mark is_tap={is_tap} len={gesture_len:.1} rel={:?} canvas={:?} inC={} npts={}",
-                    pos,
-                    canvas,
-                    canvas.contains(pos),
-                    self.draw_page.points.len()
-                );
+                // 仅在抬起帧判定并重置：touch_moved 在移动帧与抬起帧之间保持锁存
+                let is_tap = !self.draw_page.touch_moved;
+                let gesture_len = match self.draw_page.touch_track.take() {
+                    Some(p) => (pos - p).length(),
+                    None => 0.0,
+                };
+                self.draw_page.touch_moved = false;
                 if is_tap && gesture_len < 12.0 && canvas.contains(pos) {
                     let (la, lo) = self.draw_page.map.to_lonlat(canvas, pos);
                     let too_close = self
@@ -313,16 +289,8 @@ impl App {
                     if !too_close {
                         self.draw_page.points.push((la, lo));
                     }
-                    add_diag.push_str(&format!(" -> ADD ok too_close={too_close}"));
                 }
             }
-        }
-        if !add_diag.is_empty() {
-            let _ = std::fs::create_dir_all("/sdcard/Android/data/org.nekosportsworld.tool/files");
-            let _ = std::fs::write(
-                "/sdcard/Android/data/org.nekosportsworld.tool/files/tap_diag.txt",
-                &add_diag,
-            );
         }
 
         // 软件光栅化路线叠加层（本机 Android 上仅 Image 图元稳定渲染，
