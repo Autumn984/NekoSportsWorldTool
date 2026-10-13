@@ -172,11 +172,15 @@ impl TileState {
         rect: egui::Rect,
     ) {
         let zt = zoom.round().clamp(ZOOM_MIN, ZOOM_MAX) as u32;
-        let (wx, wy) = lonlat_to_world(center.1, center.0, zt as f64);
+        let zr = zoom as f64;
+        let (wx, wy) = lonlat_to_world(center.1, center.0, zr);
         let c = rect.center();
-        // 屏幕左上角对应的世界像素（偏移符号与 draw/map.to_screen 一致）
-        let left = wx - (c.x - rect.left()) as f64 - offset.x as f64;
-        let top = wy - (c.y - rect.top()) as f64 - offset.y as f64;
+        // 屏幕左上角对应的世界像素（原始级别，与 draw/to_screen 同一约定）
+        let left_w = wx - (c.x - rect.left()) as f64 - offset.x as f64;
+        let top_w = wy - (c.y - rect.top()) as f64 - offset.y as f64;
+        let sc = 2f64.powf(zr - zt as f64);
+        let left = left_w / sc;
+        let top = top_w / sc;
         let x0 = (left / TILE_PX).floor() as i64;
         let y0 = (top / TILE_PX).floor() as i64;
         let n = (rect.width() as f64 / TILE_PX).ceil() as i64 + 2;
@@ -216,7 +220,9 @@ impl TileState {
     }
 
     /// 绘制可见瓦片（世界像素 → 屏幕矩形）。
-    /// - 偏移符号与 map.rs to_screen 一致：offset 增大 → 内容向右（跟随手指）。
+    /// 与 map.rs to_screen 完全同一约定（原始缩放级别世界像素），
+    /// 保证分数级缩放（捏合）时瓦片与路线覆盖层、缩放锚定补偿严格一致、不漂移。
+    /// - offset 增大 → 内容向右（跟随手指）。
     /// - 当前层级瓦片缺失时，用相邻层级（±2）瓦片缩放兜底，避免缩放瞬间空白。
     /// - 所有瓦片裁剪到 rect 内，不越出地图框。
     pub fn draw(
@@ -227,12 +233,10 @@ impl TileState {
         offset: egui::Vec2,
         rect: egui::Rect,
     ) {
+        let zr = zoom as f64;
         let zt = zoom.round().clamp(ZOOM_MIN, ZOOM_MAX) as u32;
-        let scale = 2f64.powf((zoom - zt as f32) as f64);
-        let (wx, wy) = lonlat_to_world(center.1, center.0, zt as f64);
+        let (wx, wy) = lonlat_to_world(center.1, center.0, zr);
         let c = rect.center();
-        let left = wx - (c.x - rect.left()) as f64 - offset.x as f64;
-        let top = wy - (c.y - rect.top()) as f64 - offset.y as f64;
 
         // 从远层级到近层级绘制（当前层级最后画，盖在兜底瓦片上方）
         let mut levels: Vec<u32> = self
@@ -244,24 +248,38 @@ impl TileState {
         levels.sort_by_key(|z| (z.abs_diff(zt), *z));
         levels.dedup();
         for lv in levels.iter().rev() {
-            let lv_scale = 2f64.powi(*lv as i32 - zt as i32); // zt 世界像素下该层级瓦片边长倍率
             for (key, tex) in &self.textures {
                 if key.z != *lv {
                     continue;
                 }
-                let xw = key.x as f64 * TILE_PX * lv_scale;
-                let yw = key.y as f64 * TILE_PX * lv_scale;
-                let sx = (xw - left) * scale + rect.left() as f64;
-                let sy = (yw - top) * scale + rect.top() as f64;
-                let size = (TILE_PX * lv_scale * scale) as f32;
-                let full = egui::Rect::from_min_size(
-                    egui::Pos2::new(sx as f32, sy as f32),
-                    egui::Vec2::splat(size),
-                );
+                let full = tile_screen_rect(*key, center, zoom, offset, rect);
                 draw_image_clipped(painter, tex.id(), full, rect);
             }
         }
     }
+}
+
+/// 瓦片在屏幕上的矩形：与 map.rs to_screen 完全同一约定
+/// （原始缩放级别世界像素：p = c + (W - w) + offset），分数级缩放时不漂移。
+fn tile_screen_rect(
+    key: TileKey,
+    center: (f64, f64),
+    zoom: f32,
+    offset: egui::Vec2,
+    rect: egui::Rect,
+) -> egui::Rect {
+    let zr = zoom as f64;
+    let (wx, wy) = lonlat_to_world(center.1, center.0, zr);
+    let c = rect.center();
+    let lv_sc = 2f64.powf(zr - key.z as f64);
+    let xw = key.x as f64 * TILE_PX * lv_sc;
+    let yw = key.y as f64 * TILE_PX * lv_sc;
+    let sx = c.x as f64 + (xw - wx) + offset.x as f64;
+    let sy = c.y as f64 + (yw - wy) + offset.y as f64;
+    egui::Rect::from_min_size(
+        egui::Pos2::new(sx as f32, sy as f32),
+        egui::Vec2::splat((TILE_PX * lv_sc) as f32),
+    )
 }
 
 /// 绘制图片并裁剪到 clip 内（手动求交并换算 UV，避免本设备上 clip 区域异常）。
@@ -344,5 +362,31 @@ mod tests {
         assert!(url.contains("x=10"));
         assert!(url.contains("y=20"));
         assert!(url.contains("z=12"));
+    }
+
+    /// 分数级缩放时，视野中心（c + offset）必须落在中心所在瓦片的矩形内——
+    /// 保证瓦片与 map.to_screen/缩放锚定补偿严格一致、不漂移。
+    #[test]
+    fn tile_rect_anchors_center_at_fractional_zoom() {
+        let center = (38.90, 121.54);
+        let zoom = 16.4f32;
+        let offset = egui::Vec2::new(37.5, -22.25);
+        let rect = egui::Rect::from_min_max(
+            egui::Pos2::new(8.0, 380.0),
+            egui::Pos2::new(352.0, 784.0),
+        );
+        let zt = zoom.round() as u32;
+        let (wx, wy) = lonlat_to_world(center.1, center.0, zt as f64);
+        let key = TileKey {
+            z: zt,
+            x: (wx / TILE_PX).floor() as u32,
+            y: (wy / TILE_PX).floor() as u32,
+        };
+        let r = tile_screen_rect(key, center, zoom, offset, rect);
+        let anchor = rect.center() + offset;
+        assert!(
+            r.contains(anchor),
+            "anchor={anchor:?} not in tile rect {r:?}"
+        );
     }
 }
