@@ -120,8 +120,9 @@ impl eframe::App for App {
         crate::platform::set_keep_screen_on(self.run_busy || self.ai_busy || self.login_busy);
         ctx.request_repaint_after(std::time::Duration::from_millis(200));
 
-        // ── 顶栏 ────────────────────────────────────────────────
-        egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
+        // ── 顶栏（手绘页全屏：隐藏登录顶栏，地图占满屏幕） ──────
+        if self.tab != 8 {
+            egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.add_space(6.0);
             let compact = mobile::compact_ui(ui);
             let logged = self.session.is_some();
@@ -217,9 +218,11 @@ impl eframe::App for App {
                 }
             }
             ui.add_space(4.0);
-        });
+            });
+        }
 
-        // ── 底部状态栏 ──────────────────────────────────────────
+        // ── 底部状态栏（手绘页全屏时同样隐藏） ──────────────────
+        if self.tab != 8 {
         egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
@@ -270,6 +273,7 @@ impl eframe::App for App {
             });
             ui.add_space(2.0);
         });
+        }
 
         // ── 标签页 ──────────────────────────────────────────────
         egui::CentralPanel::default().show(ctx, |ui| {

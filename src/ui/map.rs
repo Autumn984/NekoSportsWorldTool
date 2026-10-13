@@ -104,34 +104,54 @@ impl MapState {
 
     /// 处理拖拽/缩放交互（需在分配好 rect 后调用）。
     /// 缩放以指针位置为中心：指针下的地理点保持不动。
+    /// 支持滚轮（raw_scroll_delta）与触控双指捏合（zoom_delta）两种缩放输入。
     pub fn interact(&mut self, ui: &egui::Ui, rect: Rect) {
         self.dragged = false;
-        let (drag, scroll, pointer) = ui.input(|i| {
+        let (drag, scroll, zoom_gesture, pointer) = ui.input(|i| {
             let hover = i
                 .pointer
                 .interact_pos()
                 .map(|p| rect.contains(p))
                 .unwrap_or(false);
             let dragging = hover && i.pointer.primary_down() && i.pointer.is_decidedly_dragging();
-            (dragging, i.raw_scroll_delta.y, i.pointer.interact_pos())
+            (
+                dragging,
+                i.raw_scroll_delta.y,
+                i.zoom_delta(),
+                i.pointer.interact_pos(),
+            )
         });
         if drag {
             let d = ui.input(|i| i.pointer.delta());
             self.offset += d;
             self.dragged = true;
         }
-        if scroll != 0.0 {
+        let zoom_factor = if scroll != 0.0 {
+            Some(1.0 + (scroll / 50.0) * 0.5)
+        } else if (zoom_gesture - 1.0).abs() > 1e-4 {
+            Some(zoom_gesture)
+        } else {
+            None
+        };
+        if let Some(factor) = zoom_factor {
             if let Some(pos) = pointer.filter(|p| rect.contains(*p)) {
                 // 指针下的地理点保持不动：offset 补偿世界像素变化
                 let _ = pos;
                 let old_world = self.world();
-                let notches = scroll / 50.0;
-                self.zoom = (self.zoom + notches as f32 * 0.5).clamp(ZOOM_MIN, ZOOM_MAX);
+                self.zoom = (self.zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
                 let new_world = self.world();
                 self.offset.x += (new_world.0 - old_world.0) as f32;
                 self.offset.y += (new_world.1 - old_world.1) as f32;
+            } else {
+                self.zoom = (self.zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
             }
         }
+    }
+
+    /// 以画布中心缩放（放大/缩小按钮用）。
+    /// 视野中心点始终渲染在 rect.center + offset，因此只需改 zoom。
+    pub fn zoom_around_center(&mut self, factor: f32) {
+        self.zoom = (self.zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
     }
 
     /// 填充线段：沿线段放置重叠小方块（本机 Android/Mali 上除 rect/image/text

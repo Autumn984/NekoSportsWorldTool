@@ -10,6 +10,16 @@ use super::{theme, App};
 use eframe::egui;
 use egui::{Pos2, Sense};
 
+/// 手绘页操作模式：浏览（平移/缩放）与标点（点击加点）互相独立。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum DrawMode {
+    /// 浏览模式：拖拽平移、滚轮/捏合缩放，点击不加点。
+    #[default]
+    Browse,
+    /// 标点模式：点击添加途经点，拖拽不平移。
+    Mark,
+}
+
 pub struct DrawPage {
     /// 途经点（GCJ-02，lat, lng），与高德瓦片同基准。
     pub points: Vec<(f64, f64)>,
@@ -24,6 +34,11 @@ pub struct DrawPage {
     /// 路线叠加纹理缓存（脏检查）。
     pub overlay_fp: (u64, u64, u64, u64, u64, u64, u64, u64),
     pub overlay_tex: Option<egui::TextureHandle>,
+    /// 操作模式：浏览 / 标点。
+    pub mode: DrawMode,
+    /// 触控跟踪：本设备不投递 Touch(Start)，用首个已知位置 + 移动距离判定点击。
+    pub touch_track: Option<Pos2>,
+    pub touch_moved: bool,
 }
 
 impl Default for DrawPage {
@@ -38,6 +53,9 @@ impl Default for DrawPage {
             toolbar_rect: egui::Rect::NOTHING,
             overlay_fp: (0, 0, 0, 0, 0, 0, 0, 0),
             overlay_tex: None,
+            mode: DrawMode::Browse,
+            touch_track: None,
+            touch_moved: false,
         }
     }
 }
@@ -92,8 +110,24 @@ impl App {
         let mut want_retry_tiles = false;
 
         // 工具栏（普通布局，画布上方）
+        let mut btn_diag = String::new();
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().button_padding = egui::vec2(6.0, 3.0);
+            ui.label("模式：");
+            ui.selectable_value(&mut self.draw_page.mode, DrawMode::Browse, "浏览");
+            ui.selectable_value(&mut self.draw_page.mode, DrawMode::Mark, "标点");
+            ui.separator();
+            let z1 = ui.small_button("放大");
+            btn_diag.push_str(&format!("放大={:?};", z1.rect));
+            if z1.clicked() {
+                self.draw_page.map.zoom_around_center(1.4);
+            }
+            let z2 = ui.small_button("缩小");
+            btn_diag.push_str(&format!("缩小={:?};", z2.rect));
+            if z2.clicked() {
+                self.draw_page.map.zoom_around_center(1.0 / 1.4);
+            }
+            ui.separator();
             if ui.small_button("撤销").clicked() {
                 self.draw_page.points.pop();
             }
@@ -102,16 +136,25 @@ impl App {
                 self.draw_page.status = String::new();
             }
             ui.checkbox(&mut self.draw_page.auto_close, "闭合");
-            if ui.small_button("保存路线").clicked() {
+            let s1 = ui.small_button("保存路线");
+            btn_diag.push_str(&format!("保存={:?};", s1.rect));
+            if s1.clicked() {
                 want_save = true;
             }
-            if ui.small_button("去跑步").clicked() {
+            let g1 = ui.small_button("去跑步");
+            btn_diag.push_str(&format!("去跑步={:?};", g1.rect));
+            if g1.clicked() {
                 want_run_tab = true;
             }
             if ui.small_button("重试瓦片").clicked() {
                 want_retry_tiles = true;
             }
         });
+        let _ = std::fs::create_dir_all("/sdcard/Android/data/org.nekosportsworld.tool/files");
+        let _ = std::fs::write(
+            "/sdcard/Android/data/org.nekosportsworld.tool/files/btn_diag.txt",
+            &btn_diag,
+        );
         let n = self.draw_page.points.len();
         let smooth = if n >= 2 {
             crate::track::geom::smooth_polyline(&self.draw_page.points, 12, self.draw_page.auto_close)
@@ -120,10 +163,14 @@ impl App {
         };
         ui.horizontal_wrapped(|ui| {
             let len = polyline_length(&smooth, false);
+            let mode_hint = match self.draw_page.mode {
+                DrawMode::Browse => "浏览：拖拽平移 · 捏合/按钮缩放",
+                DrawMode::Mark => "标点：点击地图添加途经点",
+            };
             let hint = if n > 0 {
-                format!("{} 点·全长 {:.0} m", n, len)
+                format!("{} 点·全长 {:.0} m · {mode_hint}", n, len)
             } else {
-                "点击地图加点".to_string()
+                mode_hint.to_string()
             };
             ui.label(egui::RichText::new(hint).small().color(theme::plain()));
             ui.label(
@@ -139,9 +186,9 @@ impl App {
         });
         ui.add_space(2.0);
 
-        // 地图画布：固定高度（ScrollArea 内可滚动页面）
+        // 地图画布：占满剩余全部空间（手绘页隐藏顶/底栏后即全屏）
         let full = ui.available_rect_before_wrap();
-        let size = egui::Vec2::new(full.width().max(200.0), 430.0);
+        let size = egui::Vec2::new(full.width().max(200.0), full.height().max(300.0));
         let (response, _p) = ui.allocate_painter(size, Sense::click_and_drag());
         let canvas = response.rect;
         let painter = ui.painter();
@@ -181,38 +228,101 @@ impl App {
             self.draw_page.map.offset,
             canvas,
         );
-        self.draw_page.map.interact(ui, canvas);
+        // 浏览模式：平移/缩放；标点模式：不平移，点击加点
+        if self.draw_page.mode == DrawMode::Browse {
+            self.draw_page.map.interact(ui, canvas);
+        }
 
-        // 单击添加点：从原始事件里取「主键抬起」的位置（egui 触控抬起后 pointer
-        // 位置会被清空，latest_pos/interact_pos 均不可靠）；手势总位移小于阈值才算点击。
-        let gesture_drag = response.drag_delta().length();
+        // 标点模式点击加点：本设备不投递 Touch(Start)/PointerButton(true)，
+        // 只有 Touch(End)+PointerButton(false)。区分点击与滑动：
+        // 点击 = 无 Touch(Move)（或移动 < 阈值）；滑动 = 有移动事件。
         let mut release_pos: Option<Pos2> = None;
         ui.input(|i| {
             for e in &i.raw.events {
-                if let egui::Event::PointerButton {
-                    pos,
-                    button: egui::PointerButton::Primary,
-                    pressed: false,
-                    ..
-                } = e
-                {
-                    release_pos = Some(*pos);
+                match e {
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        ..
+                    }
+                    | egui::Event::Touch {
+                        phase: egui::TouchPhase::Start,
+                        pos,
+                        ..
+                    } => {
+                        self.draw_page.touch_track = Some(*pos);
+                        self.draw_page.touch_moved = false;
+                    }
+                    egui::Event::Touch {
+                        phase: egui::TouchPhase::Move,
+                        pos,
+                        ..
+                    }
+                    | egui::Event::PointerMoved(pos) => {
+                        let moved = match self.draw_page.touch_track {
+                            Some(p0) => (*pos - p0).length() > 8.0,
+                            None => {
+                                self.draw_page.touch_track = Some(*pos);
+                                false
+                            }
+                        };
+                        if moved {
+                            self.draw_page.touch_moved = true;
+                        }
+                    }
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        ..
+                    }
+                    | egui::Event::Touch {
+                        phase: egui::TouchPhase::End,
+                        pos,
+                        ..
+                    } => release_pos = Some(*pos),
+                    _ => {}
                 }
             }
         });
-        if let Some(pos) = release_pos {
-            if gesture_drag < 6.0 && canvas.contains(pos) {
-                let (la, lo) = self.draw_page.map.to_lonlat(canvas, pos);
-                let too_close = self
-                    .draw_page
-                    .points
-                    .last()
-                    .map(|&last| dist_m(last, (la, lo)) < 3.0)
-                    .unwrap_or(false);
-                if !too_close {
-                    self.draw_page.points.push((la, lo));
+        let is_tap = !self.draw_page.touch_moved;
+        let gesture_len = match (self.draw_page.touch_track.take(), release_pos) {
+            (Some(p), Some(r)) => (r - p).length(),
+            _ => 0.0,
+        };
+        self.draw_page.touch_moved = false;
+        let mut add_diag = String::new();
+        if self.draw_page.mode == DrawMode::Mark {
+            if let Some(pos) = release_pos {
+                add_diag = format!(
+                    "mode=Mark is_tap={is_tap} len={gesture_len:.1} rel={:?} canvas={:?} inC={} npts={}",
+                    pos,
+                    canvas,
+                    canvas.contains(pos),
+                    self.draw_page.points.len()
+                );
+                if is_tap && gesture_len < 12.0 && canvas.contains(pos) {
+                    let (la, lo) = self.draw_page.map.to_lonlat(canvas, pos);
+                    let too_close = self
+                        .draw_page
+                        .points
+                        .last()
+                        .map(|&last| dist_m(last, (la, lo)) < 3.0)
+                        .unwrap_or(false);
+                    if !too_close {
+                        self.draw_page.points.push((la, lo));
+                    }
+                    add_diag.push_str(&format!(" -> ADD ok too_close={too_close}"));
                 }
             }
+        }
+        if !add_diag.is_empty() {
+            let _ = std::fs::create_dir_all("/sdcard/Android/data/org.nekosportsworld.tool/files");
+            let _ = std::fs::write(
+                "/sdcard/Android/data/org.nekosportsworld.tool/files/tap_diag.txt",
+                &add_diag,
+            );
         }
 
         // 软件光栅化路线叠加层（本机 Android 上仅 Image 图元稳定渲染，
